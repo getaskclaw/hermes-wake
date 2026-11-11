@@ -6,6 +6,7 @@ through the documented ``hermes kanban`` CLI (user-guide/features/kanban.md).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -40,6 +41,8 @@ NON_MESSAGING = {"", "api_server", "cli", "codex", "desktop", "gateway", "kanban
                  "tool", "tui", "webhook"}
 CHAT_TYPES = ("dm", "group", "channel", "thread")
 CHILD_DENIED = "delegate_task child"
+logger = logging.getLogger("hermes_wake")
+_warned_units: set = set()
 
 
 class KanbanError(RuntimeError):
@@ -114,6 +117,15 @@ class KanbanCLI:
     def subscribe_wake(self, task_id: str, origin: dict) -> None:
         self._run(subscribe_args(task_id, origin))
 
+    def unsubscribe(self, task_id: str, origin: dict) -> None:
+        a = ["notify-unsubscribe", task_id, "--platform", origin["platform"], "--chat-id", origin["chat_id"]]
+        if origin.get("thread_id"):
+            a += ["--thread-id", origin["thread_id"]]
+        self._run(a)
+
+    def archive(self, task_id: str) -> None:
+        self._run(["archive", task_id])
+
     def complete(self, task_id: str, summary: str, metadata: dict) -> None:
         self._run(["complete", task_id, "--force", "--summary", summary[:1500],
                    "--metadata", json.dumps(metadata)])
@@ -143,26 +155,70 @@ def proc_start_time(pid: int) -> Optional[str]:
     return raw.rsplit(")", 1)[1].split()[19]
 
 
-def unit_state(unit: str, runner=subprocess.run) -> dict:
-    """ActiveState/LoadState/Result/ExecMainStatus, trying the user manager then the system one."""
-    last = {}
+def _warn_once(unit: str, msg: str) -> None:
+    if unit not in _warned_units:
+        _warned_units.add(unit)
+        logger.warning("hermes-wake: %s", msg)
+
+
+def unit_state(unit: str, runner=subprocess.run) -> Optional[dict]:
+    """ActiveState/LoadState/Result/ExecMainStatus, trying the user manager then the system one.
+
+    Returns None ("unknown, keep watching") unless some systemctl call succeeded (rc 0) and
+    printed a LoadState. A failed, empty or timed-out query never means "finished".
+    """
+    answered = None
+    errors = []
     for scope in (["--user"], []):
         try:
             r = runner(["systemctl", *scope, "show", unit, "-p",
                         "LoadState,ActiveState,SubState,Result,ExecMainStatus"],
                        capture_output=True, text=True, timeout=20)
-        except (OSError, subprocess.TimeoutExpired):
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            errors.append(f"{'user' if scope else 'system'}: {exc}")
+            continue
+        if getattr(r, "returncode", 1) != 0:
+            errors.append(f"{'user' if scope else 'system'}: rc={r.returncode}")
             continue
         props = dict(line.split("=", 1) for line in (r.stdout or "").splitlines() if "=" in line)
+        if not props.get("LoadState"):
+            errors.append(f"{'user' if scope else 'system'}: no LoadState in output")
+            continue
         props["scope"] = "user" if scope else "system"
-        last = props
-        if props.get("LoadState") == "loaded":
+        if props["LoadState"] == "loaded":
             return props
-    return last
+        answered = answered or props
+    if answered is None:
+        _warn_once(unit, f"systemctl show {unit} gave no usable answer ({'; '.join(errors)}); "
+                         "treating the unit as still running")
+    return answered
+
+
+def _unit_outcome(target: str, s: Optional[dict]) -> Optional[str]:
+    if s is None:
+        return None
+    if s.get("LoadState") == "not-found":
+        return f"unit {target} finished and was unloaded"
+    if s.get("LoadState") == "loaded" and s.get("ActiveState") in ("inactive", "failed"):
+        return (f"unit {target} {s.get('ActiveState')} (result={s.get('Result', '?')}, "
+                f"exit={s.get('ExecMainStatus', '?')})")
+    return None
+
+
+def path_stat(target: str) -> Optional[list]:
+    try:
+        st = os.stat(target)
+    except OSError:
+        return None
+    return [st.st_mtime_ns, st.st_size]
 
 
 def check(watch: dict, runner=subprocess.run, now: Optional[float] = None) -> Optional[str]:
-    """Return a human outcome string when the watched work is over, else None."""
+    """Return a human outcome string when the watched work is over, else None.
+
+    Path watches may update ``watch["path_seen"]`` (persisted by ``tick``): a path fires only
+    when it is new or changed since registration and its mtime+size held still for two ticks.
+    """
     now = time.time() if now is None else now
     kind, target = watch["kind"], watch["target"]
     if kind == "pid":
@@ -170,16 +226,18 @@ def check(watch: dict, runner=subprocess.run, now: Optional[float] = None) -> Op
         if st is None or st != watch.get("pid_start"):
             return f"process {target} exited"
     elif kind == "path":
-        p = Path(target)
-        if p.exists():
-            return f"{target} appeared ({p.stat().st_size} bytes)"
+        cur = path_stat(target)
+        baseline = watch.get("path_initial")  # [mtime_ns, size] at registration, or None
+        if cur is not None and cur != baseline:
+            if watch.get("path_seen") == cur:
+                return f"{target} {'changed' if baseline else 'appeared'} ({cur[1]} bytes)"
+            watch["path_seen"] = cur
+        else:
+            watch.pop("path_seen", None)
     elif kind == "unit":
-        s = unit_state(target, runner)
-        if s.get("LoadState") != "loaded":
-            return f"unit {target} finished and was unloaded"
-        if s.get("ActiveState") in ("inactive", "failed"):
-            return (f"unit {target} {s.get('ActiveState')} (result={s.get('Result', '?')}, "
-                    f"exit={s.get('ExecMainStatus', '?')})")
+        out = _unit_outcome(target, unit_state(target, runner))
+        if out:
+            return out
     if now - watch["created_at"] > watch["max_wait_s"]:
         return f"gave up waiting after {int(watch['max_wait_s'])}s ({kind} {target} still running)"
     return None
@@ -198,13 +256,15 @@ def validate_target(kind: str, target: str, runner=subprocess.run) -> dict:
         if not re.fullmatch(r"[\w@.:\-\\]+", target):
             raise ValueError("invalid unit name")
         s = unit_state(target, runner)
+        if s is None:
+            raise ValueError(f"could not query systemd for {target} (systemctl failed or timed out)")
         if s.get("LoadState") != "loaded":
             raise ValueError(f"unit {target} is not loaded (already finished, or wrong name?)")
         return {"unit_scope": s.get("scope", "")}
     if kind == "path":
         if not os.path.isabs(target):
             raise ValueError("path must be absolute")
-        return {}
+        return {"path_initial": path_stat(target)}
     raise ValueError(f"unknown kind {kind}")
 
 
@@ -240,6 +300,15 @@ class Store:
     def set_task(self, wid, task_id):
         with self._conn() as c:
             c.execute("UPDATE watches SET task_id=? WHERE id=?", (task_id, wid))
+
+    def set_extra(self, wid, updates: dict):
+        with self._conn() as c:
+            r = c.execute("SELECT extra FROM watches WHERE id=?", (wid,)).fetchone()
+            if r is None:
+                return
+            extra = json.loads(r["extra"] or "{}")
+            extra.update(updates)
+            c.execute("UPDATE watches SET extra=? WHERE id=?", (json.dumps(extra), wid))
 
     def delete(self, wid):
         with self._conn() as c:
@@ -320,7 +389,10 @@ def tick(store: Store, kanban: KanbanCLI, runner=subprocess.run, now=None, log=N
     """One pass. Returns the watch ids completed in this pass. Safe to run in many processes."""
     done = []
     for w in store.active(now):
+        seen = w.get("path_seen")
         outcome = check(w, runner, now)
+        if w.get("path_seen") != seen:
+            store.set_extra(w["id"], {"path_seen": w.get("path_seen")})
         if outcome is None:
             continue
         if not store.claim(w["id"], w["state"], w["claimed_at"], now):

@@ -3,7 +3,8 @@ version: "0.1.0"
 manifest_version: 2
 api_version: 1
 description: "Wake the originating chat session when background work started outside the chat (systemd-run unit, nohup process, result file) ends."
-author: "hermes-wake contributors"
+author: "BlueBirdBack"
+homepage: "https://github.com/getaskclaw/hermes-wake"
 license: MIT
 requires_hermes: ">=0.23.1"
 tags: [gateway, kanban, background, notifications]

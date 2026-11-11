@@ -64,7 +64,7 @@ WAKE_ME_WHEN = {
         "properties": {
             "unit": {"type": "string", "description": "systemd unit name (user or system), e.g. job-42.service"},
             "pid": {"type": "integer", "description": "process id to wait for"},
-            "path": {"type": "string", "description": "absolute path; wake when it exists"},
+            "path": {"type": "string", "description": "absolute path; wake when it is created, or changed if it already exists, and its size has settled"},
             "note": {"type": "string", "description": "what to do when woken, e.g. 'read /tmp/out.md and summarise'"},
             "max_wait_hours": {"type": "number", "description": "give up and wake anyway after this long (default 24)"},
         },
@@ -73,7 +73,8 @@ WAKE_ME_WHEN = {
 
 WAKE_LIST = {
     "name": "wake_list",
-    "description": "List hermes-wake watches that are still pending (optionally cancel one by id).",
+    "description": ("List hermes-wake watches registered from THIS chat that are still pending "
+                    "(optionally cancel one by id; cancelling also archives its kanban card)."),
     "parameters": {
         "type": "object",
         "properties": {"cancel": {"type": "string", "description": "watch id to cancel"}},
@@ -116,14 +117,39 @@ def wake_me_when(args, **_kw):
                                   "No need to poll or promise a check-back time."})
 
 
+def _same_chat(a: dict, b: dict) -> bool:
+    return all((a.get(k) or "") == (b.get(k) or "") for k in ("platform", "chat_id", "thread_id"))
+
+
 def wake_list(args, **_kw):
+    """List or cancel watches, scoped to the caller's chat (platform + chat_id + thread_id)."""
+    args = args or {}
+    origin = core.capture_origin(_getenv)
+    if not core.origin_is_wakeable(origin):
+        return _err("no messaging-gateway origin in this session; wake_list only shows watches "
+                    "registered from the current chat")
     store = _store()
-    if (args or {}).get("cancel"):
-        ok = store.cancel(args["cancel"])
-        return json.dumps({"ok": ok, "cancelled": args["cancel"] if ok else None,
-                           "note": "the parked kanban card stays blocked; archive it if you like"})
+    mine = [w for w in store.list() if _same_chat(w["origin"], origin)]
+    if args.get("cancel"):
+        wid = str(args["cancel"])
+        w = next((w for w in mine if w["id"] == wid), None)
+        if w is None or not store.cancel(wid):
+            return _err(f"no pending watch {wid} in this chat")
+        cleanup = []
+        if w.get("task_id"):
+            kb = _kanban()
+            for step, fn in (("notify-unsubscribe", lambda: kb.unsubscribe(w["task_id"], w["origin"])),
+                             ("archive", lambda: kb.archive(w["task_id"]))):
+                try:
+                    fn()
+                    cleanup.append(step)
+                except Exception as exc:
+                    logger.warning("hermes-wake: %s %s failed: %s", step, w["task_id"], exc)
+                    cleanup.append(f"{step} failed: {exc}")
+        return json.dumps({"ok": True, "cancelled": wid, "kanban_task": w.get("task_id"),
+                           "kanban_cleanup": cleanup})
     rows = [{k: w.get(k) for k in ("id", "kind", "target", "note", "state", "task_id", "last_error")}
-            for w in store.list()]
+            for w in mine]
     return json.dumps({"ok": True, "watches": rows})
 
 
