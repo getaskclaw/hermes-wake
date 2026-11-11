@@ -1,0 +1,18 @@
+name: hermes-wake
+version: "0.1.0"
+manifest_version: 2
+api_version: 1
+description: "Wake the originating chat session when background work started outside the chat (systemd-run unit, nohup process, result file) ends."
+author: "hermes-wake contributors"
+license: MIT
+requires_hermes: ">=0.23.1"
+tags: [gateway, kanban, background, notifications]
+provides_tools:
+  - wake_me_when
+  - wake_list
+provides_hooks:
+  - transform_terminal_output
+config_schema:
+  board: {type: str, default: "hermes-wake", description: "Kanban board that holds the parked wake cards"}
+  hermes_bin: {type: str, default: "", description: "Path to the hermes executable (default: hermes on PATH)"}
+  terminal_hint: {type: bool, default: true, description: "Append a wake_me_when hint to terminal output that launches detached work"}
