@@ -161,15 +161,18 @@ def _warn_once(unit: str, msg: str) -> None:
         logger.warning("hermes-wake: %s", msg)
 
 
-def unit_state(unit: str, runner=subprocess.run) -> Optional[dict]:
+def unit_state(unit: str, runner=subprocess.run, scope: str = "") -> Optional[dict]:
     """ActiveState/LoadState/Result/ExecMainStatus, trying the user manager then the system one.
 
     Returns None ("unknown, keep watching") unless some systemctl call succeeded (rc 0) and
     printed a LoadState. A failed, empty or timed-out query never means "finished".
+    ``scope`` ("user"/"system") pins the query to the manager that owned the unit at
+    registration, so a hiccup in that manager can't be masked by "not-found" from the other.
     """
     answered = None
     errors = []
-    for scope in (["--user"], []):
+    scopes = {"user": [["--user"]], "system": [[]]}.get(scope, [["--user"], []])
+    for scope in scopes:
         try:
             r = runner(["systemctl", *scope, "show", unit, "-p",
                         "LoadState,ActiveState,SubState,Result,ExecMainStatus"],
@@ -235,7 +238,7 @@ def check(watch: dict, runner=subprocess.run, now: Optional[float] = None) -> Op
         else:
             watch.pop("path_seen", None)
     elif kind == "unit":
-        out = _unit_outcome(target, unit_state(target, runner))
+        out = _unit_outcome(target, unit_state(target, runner, watch.get("unit_scope", "")))
         if out:
             return out
     if now - watch["created_at"] > watch["max_wait_s"]:

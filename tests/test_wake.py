@@ -363,3 +363,16 @@ def test_wake_list_scoped_and_cancel_archives(env, monkeypatch):
 def test_wake_list_requires_origin(monkeypatch):
     monkeypatch.setattr(hw, "_getenv", lambda n, d="": d)
     assert not json.loads(hw.wake_list({}))["ok"]
+
+
+def test_unit_scope_pinned_mixed_failure():
+    """User manager owned the unit; its query fails while system says not-found -> keep watching."""
+    def run(cmd, **kw):
+        if "--user" in cmd:
+            return SimpleNamespace(returncode=1, stdout="", stderr="bus hiccup")
+        return SimpleNamespace(returncode=0, stdout="LoadState=not-found\nActiveState=inactive\n")
+    w = {"kind": "unit", "target": "x.service", "created_at": time.time(), "max_wait_s": 3600,
+         "unit_scope": "user"}
+    assert core.check(w, run) is None
+    w_sys = dict(w, unit_scope="system")
+    assert "finished" in core.check(w_sys, run)
